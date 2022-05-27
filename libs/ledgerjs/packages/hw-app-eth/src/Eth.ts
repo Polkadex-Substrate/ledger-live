@@ -17,7 +17,14 @@
 // FIXME drop:
 import type Transport from "@ledgerhq/hw-transport";
 import { BigNumber } from "bignumber.js";
-import { decodeTxInfo } from "./utils";
+import {
+  constructTypeDescByteString,
+  decodeTxInfo,
+  destructTypeFromString,
+  EIP712_ARRAY_TYPE_VALUE,
+  EIP712_TYPE_PROPERTIES,
+  intAsHexBytes,
+} from "./utils";
 // NB: these are temporary import for the deprecated fallback mechanism
 import { LedgerEthTransactionResolution, LoadConfig } from "./services/types";
 import ledgerService from "./services/ledger";
@@ -25,6 +32,11 @@ import {
   EthAppNftNotSupported,
   EthAppPleaseEnableContractData,
 } from "./errors";
+import {
+  EIP712Message,
+  EIP712MessageTypes,
+  EIP712MessageTypesEntry,
+} from "./types";
 
 export type StarkQuantizationType =
   | "eth"
@@ -76,6 +88,7 @@ const remapTransactionRelatedErrors = (e) => {
 
   return e;
 };
+
 /**
  * Ethereum API
  *
@@ -107,6 +120,7 @@ export default class Eth {
         "signTransaction",
         "signPersonalMessage",
         "getAppConfiguration",
+        "signEIP712Message",
         "signEIP712HashedMessage",
         "starkGetPublicKey",
         "starkSignOrder",
@@ -456,6 +470,142 @@ export default class Eth {
           s,
         };
       });
+  }
+
+  async signEIP712Message(
+    fullImplem = false,
+    jsonMessage: EIP712Message
+  ): Promise<void> {
+    enum APDU_FIELDS {
+      CLA = 0xe0,
+      INS = 0x0c,
+      P1 = 0x00,
+      P2_v0 = 0x00,
+      P2_full = 0x01,
+    }
+
+    const { primaryType, types, domain, message } = jsonMessage;
+    const typeEntries = Object.entries(types) as [
+      keyof EIP712MessageTypes,
+      EIP712MessageTypesEntry[]
+    ][];
+    typeEntries.forEach(([typeName, typeEntries]) => {
+      // console.log("EIP712SendStructDefinition Name: ", { typeName });
+      // this.EIP712SendStructDefinition("name", typeName as string);
+
+      typeEntries.forEach(({ name, type }) => {
+        console.log(`EIP712SendStructDefinition ${typeName} field: `, {
+          name,
+          type,
+        });
+        const [typeDescription, arrSizes] = destructTypeFromString(type);
+        const isTypeAnArray = Boolean(arrSizes.length);
+        const typeNameUppercase = typeDescription?.name?.toUpperCase() || "";
+        const typeProperties =
+          EIP712_TYPE_PROPERTIES[typeNameUppercase] ||
+          EIP712_TYPE_PROPERTIES.CUSTOM;
+
+        const typeKey = typeProperties.key(typeDescription?.bits);
+        const typeSizeInBits = typeProperties.sizeInBits(typeDescription?.bits);
+
+        const typeDescData = constructTypeDescByteString(
+          isTypeAnArray,
+          typeSizeInBits,
+          typeKey
+        );
+
+        const bufferArray: Buffer[] = [Buffer.from(typeDescData, "hex")];
+
+        if (
+          typeProperties === EIP712_TYPE_PROPERTIES.CUSTOM &&
+          typeDescription?.name
+        ) {
+          bufferArray.push(
+            Buffer.from(intAsHexBytes(typeDescription.name.length, 1), "hex")
+          );
+          bufferArray.push(Buffer.from(typeDescription.name, "utf-8"));
+        }
+
+        if (typeof typeSizeInBits === "number") {
+          bufferArray.push(
+            Buffer.from(intAsHexBytes(typeSizeInBits, 1), "hex")
+          );
+        }
+
+        if (isTypeAnArray) {
+          bufferArray.push(
+            Buffer.from(intAsHexBytes(arrSizes.length, 1), "hex")
+          );
+
+          arrSizes.forEach((size) => {
+            bufferArray.push(
+              Buffer.from(
+                intAsHexBytes(
+                  typeof size === "number"
+                    ? EIP712_ARRAY_TYPE_VALUE.FIXED
+                    : EIP712_ARRAY_TYPE_VALUE.DYNAMIC,
+                  1
+                ),
+                "hex"
+              )
+            );
+          });
+        }
+
+        bufferArray.push(Buffer.from(intAsHexBytes(name.length, 1), "hex"));
+        bufferArray.push(Buffer.from(name, "utf-8"));
+
+        this.EIP712SendStructDefinition("field", Buffer.concat(bufferArray));
+      });
+    });
+    console.log("done signEIP712Message");
+  }
+
+  EIP712SendStructDefinition(
+    structType: "name" | "field",
+    value: string | Buffer
+  ): Promise<unknown> {
+    // console.log("EIP712SendStructDefinition", structType);
+    enum APDU_FIELDS {
+      CLA = 0xe0,
+      INS = 0x1a,
+      P1_complete = 0x00,
+      P1_partial = 0x01,
+      P2_name = 0x00,
+      P2_field = 0xff,
+    }
+    const data =
+      structType === "name" && typeof value === "string"
+        ? Buffer.from(value, "utf-8")
+        : (value as Buffer);
+    console.log("data length", data.length);
+    console.log("data value:", data);
+    console.log(
+      "APDU " +
+        Buffer.concat([
+          Buffer.from([
+            APDU_FIELDS.CLA,
+            APDU_FIELDS.INS,
+            APDU_FIELDS.P1_complete,
+            structType === "name" ? APDU_FIELDS.P2_name : APDU_FIELDS.P2_field,
+          ]),
+          Buffer.from([data.length]),
+          data,
+        ]).toString("hex")
+    );
+    console.log("\n");
+
+    return this.transport.send(
+      APDU_FIELDS.CLA,
+      APDU_FIELDS.INS,
+      APDU_FIELDS.P1_complete,
+      structType === "name" ? APDU_FIELDS.P2_name : APDU_FIELDS.P2_field,
+      data
+    );
+  }
+
+  EIP712SendStructImplementation() {
+    return null;
   }
 
   /**
